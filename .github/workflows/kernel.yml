@@ -1,0 +1,121 @@
+# Build the XNU kernel (mach.development.bcm2837) from the sources that xnu/apply.sh fetches:
+# Apple's xnu-8796.121.2 release with the redwood work on top. The recipe is the one of
+# xnu/README.md: stock clang on Linux (tested there with 22.1; xnu-deps/host/bin/xnu-clang calls
+# /usr/bin/clang), the cctools linker and iPhoneOS16.5.sdk from theos, host tools and the two
+# static libraries from xnu-deps/setup.sh. common/build.sh runs the same steps locally.
+name: XNU kernel
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+
+      - name: Host packages
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison m4 autoconf automake libtool-bin \
+            perl python3 curl git xz-utils rsync fakeroot libxml2 lld wget
+          # The newest clang apt.llvm.org has for noble; the image's own stays as the fallback.
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          for v in 22 21 20; do
+            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" |
+              sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+            if sudo apt-get update -qq && sudo apt-get install -y "clang-$v"; then
+              sudo ln -sf "/usr/bin/clang-$v" /usr/bin/clang
+              sudo ln -sf "/usr/bin/clang++-$v" /usr/bin/clang++
+              break
+            fi
+          done
+          clang --version | head -1
+          # The cctools binaries may want libtinfo5, which noble no longer ships.
+          (curl -sLO http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.1_amd64.deb &&
+            sudo dpkg -i libtinfo5_*.deb) ||
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+
+      - name: Cache theos (cctools + iPhoneOS16.5.sdk)
+        id: theos
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: theos-linux-x86_64-v1
+
+      - name: Install theos toolchain and SDK
+        if: steps.theos.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
+          # the toolchain theos's own installer takes on Linux (its bin/install-theos)
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz |
+            tar -xJ -C "$HOME/theos/toolchain/"
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/theos-sdks
+          git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
+          cp -a /tmp/theos-sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+          test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
+
+      - name: Cache the kernel tree and the dependencies
+        uses: actions/cache@v4
+        with:
+          # exact keys only: a stale restore would skip apply.sh and build yesterday's patch
+          path: |
+            xnu-src
+            xnu-deps
+          key: xnu-${{ hashFiles('xnu/**', 'xnu-deps/**', 'xnu-build.sh', 'xnu-env.sh') }}
+
+      - name: Kernel sources (Apple's release + redwood)
+        run: '[ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh'
+
+      - name: Dependencies (host tools, SDK links, the two static libraries)
+        run: xnu-deps/setup.sh
+
+      - name: Build the kernel
+        run: |
+          mkdir -p out
+          touch out/.kernel-start
+          # the export check fails after the kernel is linked, on purpose (xnu/README.md):
+          # judge by the file, the way common/build.sh does
+          ./xnu-build.sh -j"$(nproc)" -k > kernel-build.log 2>&1 || true
+          tail -40 kernel-build.log
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          if ! [ -f "$K" ] || { ! [ "$K" -nt out/.kernel-start ] && grep -q "error:" kernel-build.log; }; then
+            echo "=== the kernel did not build: $(grep -c 'error:' kernel-build.log || true) errors ==="
+            exit 1
+          fi
+          ls -la "$K"
+
+      - name: Kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mach.development.bcm2837
+          path: xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          if-no-files-found: error
+
+      - name: Logs (when it failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            kernel-build.log
+            xnu-deps/mig-build.log
+            xnu-deps/tcsh-build.log
+            xnu-deps/exporthdrs.log
+          if-no-files-found: ignore
