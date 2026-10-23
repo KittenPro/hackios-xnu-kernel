@@ -30,7 +30,9 @@ jobs:
           set -e
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison m4 autoconf automake libtool-bin \
-            perl python3 curl git xz-utils rsync fakeroot libxml2 lld wget
+            perl python3 curl git xz-utils rsync fakeroot libxml2 lld wget uuid-dev
+          # uuid-dev: hostcompat.h (force-included into every host tool) and SETUP/kextsymboltool
+          # include <uuid/uuid.h>, which Arch carries by default and Ubuntu does not.
           # The newest clang apt.llvm.org has for noble; the image's own stays as the fallback.
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
