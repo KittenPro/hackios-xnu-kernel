@@ -14,7 +14,10 @@ load_device() {
 	# shellcheck disable=SC1090
 	. "$conf"
 	DEVICE=$name
-	export DEVICE KIND
+	# subprocesses read the profile from the environment, not from this shell: ./xl calls mkxnuimg.py,
+	# which wants the boot-chain addresses (without them it silently builds the redwood-default image)
+	export DEVICE KIND NAME SOC UEFI_TARGET UEFI_FD DTB FD_BASE FD_SIZE PAYLOAD_BASE
+	export FB_BASE WIFI_ATH11K BOOTARGS DEFAULT_SECS USERLAND_VARS FIRMWARE
 	echo "${0##*/}: device $DEVICE -- $NAME ($KIND)"
 }
 

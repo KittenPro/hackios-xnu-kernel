@@ -44,6 +44,14 @@
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+# The device profile, for building the boot image: mkxnuimg.py takes UEFI_TARGET/FD_BASE/... from the
+# environment and silently builds the redwood-default image without them. A bare ./xl has none, so
+# common/devices/.default (untracked; one line: the device name) makes every invocation safe.
+if [ -z "$UEFI_TARGET" ] && [ -f common/devices/.default ]; then
+	DEVICE=$(cat common/devices/.default)
+	. common/lib.sh
+	load_device >/dev/null
+fi
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 [ -f $K ] || K=prebuilt/mach.development.bcm2837
@@ -58,8 +66,10 @@ PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone
 fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
-in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
-is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
+# the USB link can be flaky (a transaction times out now and then): retry before concluding anything,
+# or a live loader is mistaken for stock fastboot and enter() downloads an image over its payload
+in_fastboot() { local i; for i in 1 2 3; do fastboot devices 2>/dev/null | grep -q fastboot && return 0; sleep 1; done; return 1; }
+is_loader() { local i; in_fastboot || return 1; for i in 1 2 3; do fb getvar product | grep -q 'product: xnuloader' && return 0; sleep 1; done; return 1; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
