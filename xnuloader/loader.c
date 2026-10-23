@@ -287,6 +287,50 @@ find_log_partition(void)
 	return NULL;
 }
 
+/* The same search by a name the host gives ("oem parts", "oem flashpart"): exact match, ASCII here
+   and UTF-16 in the partition-info protocol. */
+static efi_block_io *
+find_named_partition(const char *want)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		int match = 1;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+			continue;
+		}
+		for (unsigned k = 0;; k++) {
+			if (k >= sizeof(info->name) / sizeof(info->name[0])) {
+				match = 0;
+				break;
+			}
+			if (want[k] == '\0') {
+				if (info->name[k] != 0) {
+					match = 0;
+				}
+				break;
+			}
+			if (info->name[k] != (char16)(uint8_t)want[k]) {
+				match = 0;
+				break;
+			}
+		}
+		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			return bio;
+		}
+	}
+	return NULL;
+}
+
 /*
  * The "staged" buffer holds the loader log followed by the kernel log of the
  * last run. It is what gets written to the log partition and what the host
@@ -296,6 +340,17 @@ static char out_buf[2 * 1024 * 1024];
 /* the storage's reads for the kernel land here (block_poll); also where the log is read back */
 #define BLOCK_BUFFER_SIZE  (4u << 20)
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
+
+/*
+ * The write path of the log partition has an affliction on at least one device: the first write of
+ * a session completes, and a later one never does (nothing lands, and the loader waits inside the
+ * driver forever). These keep track of the writes so that every one after the first can be preceded
+ * by a reset of the block I/O, and so that experiments can vary the recipe without a new build
+ * ("oem logtest", "oem writefix").
+ */
+typedef efi_status (EFIAPI *bio_reset_fn)(efi_block_io *self, uint8_t extended);
+static uint32_t write_count;            /* write_blocks calls made at the log partition this session */
+static uint32_t writefix = 1;           /* bit 0: reset the block I/O before write #2 and later; bit 1: no read-back check */
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 
@@ -358,6 +413,12 @@ write_logs(const char *klog, uint64_t klog_len)
 		compose_logs(klog, klog_len);
 		return;
 	}
+	if (write_count != 0 && (writefix & 1) && bio->reset != NULL) {
+		/* not this session's first write: on some devices the driver completes one and then
+		   never again unless the block I/O is reset in between */
+		((bio_reset_fn)bio->reset)(bio, 0);
+	}
+	write_count++;
 	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
 
 	if (!EFI_ERROR(ws)) {
@@ -367,7 +428,7 @@ write_logs(const char *klog, uint64_t klog_len)
 		 * driver must leave possible (the controller is shared with this one). The line goes into
 		 * the copy the host fetches over USB, not into the partition, which already has the rest.
 		 */
-		if (len <= sizeof(block_buffer)) {
+		if (!(writefix & 2) && len <= sizeof(block_buffer)) {
 			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
 			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
 		}
@@ -553,6 +614,17 @@ static const struct platform platform_redwood = {
 	.fb_base = 0xE1000000,
 };
 
+static const struct platform platform_beryllium = {
+	.name = "beryllium",
+	.io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000,
+	.uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A55, 4-7 are Cortex-A75 */
+	.small_cores = 0x0f,
+	.fb_base = 0x9D400000,
+};
+
 /*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
@@ -560,6 +632,7 @@ static const struct platform platform_redwood = {
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_beryllium,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -945,6 +1018,7 @@ static uint64_t sound_len;
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
+#define DEADMAN_SECONDS         120     /* past the kernel's own budget: reset rather than hold the phone forever */
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
 
 static void wdt_pet(void);
@@ -957,6 +1031,7 @@ static int wdt_armed;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
+static void set_result(const char *what, uint64_t a, uint64_t b);
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -2177,7 +2252,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_beryllium)) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2247,6 +2322,97 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 	return status;
 }
 
+/* ------------------------------------------------------------------------ */
+/* The hardware dead man: a second core that only watches a clock            */
+
+/*
+ * The dead man in the watch loop below can only rescue a hang that a running loop can see. This one
+ * covers all the others -- stuck inside a write to the storage, inside an SMC, inside the jump into
+ * the kernel -- by parking a second core in a spin that touches nothing but its own control line:
+ * unless the loader's core disarms it by the deadline, it resets the machine through PSCI. The log
+ * partition has the story up to that moment (flushed before the jump and while the kernel runs), and
+ * a boot does not overwrite it, so "oem prevlog" after the reset finds it.
+ * The guard lives on core 1; a run that gives the kernel several cores leaves it out by itself (the
+ * core list for the device tree skips cores that are on).
+ */
+struct guard_ctl {
+	uint64_t deadline;      /* the CNTVCT value at which the guard fires */
+	uint32_t disarmed;      /* non-zero: the guard should PSCI CPU_OFF itself */
+	uint32_t pad;
+};
+
+static struct guard_ctl guard_ctl __attribute__((aligned(64)));
+static int guard_on;
+
+void guard_entry(void);
+
+__asm__(
+        ".globl guard_entry\n"
+        "guard_entry:\n"                    /* x0 = &guard_ctl; MMU and caches are off */
+        "  msr daifset, #0xf\n"
+        "1: ldr x1, [x0]\n"                 /* the deadline afresh: the loader may have reset it */
+        "  mrs x2, cntvct_el0\n"
+        "  cmp x2, x1\n"
+        "  b.hs 2f\n"
+        "  ldr w3, [x0, #8]\n"
+        "  cbnz w3, 3f\n"
+        "  yield\n"
+        "  b 1b\n"
+        "2: movz x0, #0x0009\n"            /* PSCI SYSTEM_RESET = 0x84000009 */
+        "  movk x0, #0x8400, lsl #16\n"
+        "  smc #0\n"
+        "  b .\n"
+        "3: movz x0, #0x0002\n"            /* PSCI CPU_OFF = 0x84000002 */
+        "  movk x0, #0x8400, lsl #16\n"
+        "  smc #0\n"
+        "  b .\n"
+        );
+
+static void
+extend_guard(uint64_t seconds)
+{
+	if (!guard_on) {
+		return;
+	}
+	guard_ctl.deadline = READ_SYSREG(CNTVCT_EL0) + seconds * READ_SYSREG(CNTFRQ_EL0);
+	clean_dcache((uint64_t)(uintptr_t)&guard_ctl, (uint64_t)(uintptr_t)&guard_ctl + sizeof(guard_ctl));
+}
+
+static void
+arm_guard(uint64_t seconds)
+{
+	uint64_t mpidr = 1ULL << PLAT->core_shift;
+	int64_t st;
+
+	if (guard_on) {
+		extend_guard(seconds);
+		return;
+	}
+	guard_ctl.deadline = READ_SYSREG(CNTVCT_EL0) + seconds * READ_SYSREG(CNTFRQ_EL0);
+	guard_ctl.disarmed = 0;
+	clean_dcache((uint64_t)(uintptr_t)&guard_ctl, (uint64_t)(uintptr_t)&guard_ctl + sizeof(guard_ctl));
+	clean_dcache((uint64_t)(uintptr_t)&guard_entry, (uint64_t)(uintptr_t)&guard_entry + 256);
+	st = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&guard_entry, (uint64_t)(uintptr_t)&guard_ctl);
+	if (st != 0) {
+		print("guard: the firmware would not start it (%d): going without\n", st);
+		return;
+	}
+	guard_on = 1;
+	print("guard: core %x resets the machine in %d s unless disarmed\n", mpidr, seconds);
+}
+
+static void
+disarm_guard(void)
+{
+	if (!guard_on) {
+		return;
+	}
+	guard_ctl.disarmed = 1;
+	clean_dcache((uint64_t)(uintptr_t)&guard_ctl, (uint64_t)(uintptr_t)&guard_ctl + sizeof(guard_ctl));
+	guard_on = 0;
+	BS->stall(100 * 1000);              /* let the guard see the flag and hand its core back */
+}
+
 /*
  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
@@ -2298,8 +2464,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			if (PLAT->log_other_cpu) {
 				if (!arrived) {
 					print("%d s: the core has not arrived\n", noted);
-				} else {
+				} else if (live != NULL) {
 					note_kernel_progress(live, slide, noted);
+				} else {
+					print("%d s: the core has arrived; there is no kernel_live struct\n", noted);
 				}
 				flush_log();
 			}
@@ -2351,6 +2519,29 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
+			}
+		}
+		/*
+		 * The dead man: a kernel that neither comes back nor hangs visibly (its heart still
+		 * beats, or it died where this loop cannot see) must not hold the phone forever. On
+		 * platforms where the hypervisor's watchdog SMCs are not routed there is no bite to
+		 * wait for, so once the budget the kernel itself was given is this far spent, this
+		 * core resets the machine. The run's log is already in the partition (flushed before
+		 * the jump and every two seconds for the first twenty-four), and a boot does not
+		 * overwrite it: after the reset, "oem prevlog" finds it.
+		 */
+		if (budget != 0 && seconds_since(started) > budget + DEADMAN_SECONDS) {
+			if (watching_only) {
+				/* flush_log wants UEFI's services, and those wanted the interrupts */
+				__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+				__asm__ volatile ("msr daif, %0\nisb" : : "r" (daif));
+			}
+			print("dead man: %d s into a run of %d s the kernel is still on core %x: resetting\n",
+			    seconds_since(started), budget, mpidr);
+			set_result("dead-man", seconds_since(started), 0);
+			flush_log();
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			for (;;) {
 			}
 		}
 		if (block_enabled) {
@@ -2443,7 +2634,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (PLAT != &platform_redwood && PLAT != &platform_beryllium) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -2781,6 +2972,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (!choose_window(&pi)) {
 		return 0;
 	}
+	/* Checkpoints: each is a print and a flush, so after a reset the partition says how far this
+	   got. They are also the write path's exercise: on a device where only a session's first
+	   write completes, the first checkpoint lands and the second tells where it stopped. */
+	print("cp: the window is claimed\n");
+	flush_log();
 
 	uint64_t phys_base = win_base;
 	uint64_t slide = phys_base - KERNEL_VIRT_BASE; /* pa = va + slide */
@@ -2911,6 +3107,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			}
 			break;
 		}
+	}
+	print("cp: the kernel is scanned, its budget is %d s\n", kernel_budget);
+	flush_log();
+	if (kernel_budget != 0) {
+		/* the guard outlasts the software dead man by a minute: the hard reset is the last resort */
+		extend_guard(kernel_budget + DEADMAN_SECONDS + 120);
 	}
 
 	/* Give the kernel the address of our return stub and the checkpoint to stop at. */
@@ -3348,6 +3550,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
 	}
+	print("cp: back from the kernel; its cores are being checked\n");
+	flush_log();
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
 	for (int i = 1; i < cpu_count; i++) {
 		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
@@ -3424,6 +3628,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
+static uint64_t download_len;       /* what the last payload download brought ("oem flashpart" writes it) */
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
 
@@ -3596,6 +3801,17 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+static int
+has_word(const char *s, const char *w)
+{
+	for (; *s != '\0'; s++) {
+		if (starts_with(s, w)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
@@ -3608,7 +3824,8 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem flashpart") || starts_with(cmd, "oem logtest"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3682,6 +3899,8 @@ fb_command(char *cmd)
 			if (got == total) {
 				if (to_ramdisk) {
 					resident_rd_size = total;
+				} else {
+					download_len = total;
 				}
 				fb_reply("OKAY", "");
 			} else {
@@ -3743,7 +3962,14 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
-			if (!run_kernel(have_cp, cp)) {
+			/* The guard covers every hang the watch loop cannot see: a stuck write on the way,
+			   a PSCI that never answers, a stub that never comes back. run_kernel shortens its
+			   fuse once the kernel's own budget is known. */
+			arm_guard(900);
+			int started = run_kernel(have_cp, cp);
+
+			disarm_guard();
+			if (!started) {
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
 			}
@@ -3755,6 +3981,57 @@ fb_command(char *cmd)
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem logtest")) {
+			/*
+			 * One block to the log partition's LAST LBA -- a corner nothing else writes --
+			 * to try the write path without touching the forensics at LBA 0. Words in the
+			 * arguments vary the recipe: "reset" resets the block I/O first, "noverify"
+			 * skips reading the block back. Two logtests in one session try the second
+			 * write, which is the one that hangs on the afflicted device. (This branch
+			 * must stay above "oem log", whose prefix it shares.)
+			 */
+			const char *arg = cmd + 11;
+			efi_block_io *bio = find_log_partition();
+			uint64_t bs, lba;
+			efi_status ws, rs = 0;
+			int same = 0;
+			int do_reset = has_word(arg, "reset");
+			int noverify = has_word(arg, "noverify");
+
+			if (bio == NULL) {
+				fb_reply("FAIL", "no log partition");
+				return;
+			}
+			bs = bio->media->block_size;
+			lba = bio->media->last_block;
+			if (bs == 0 || bs * 2 > BLOCK_BUFFER_SIZE) {
+				fb_reply("FAIL", "odd block size");
+				return;
+			}
+			fb_reply("OKAY", "");
+			arm_guard(90);
+			memset(block_buffer, 0x5a, (size_t)bs);
+			memcpy(block_buffer, "logtest v2 ", 11);
+			if (do_reset && bio->reset != NULL) {
+				((bio_reset_fn)bio->reset)(bio, 0);
+			}
+			write_count++;
+			ws = bio->write_blocks(bio, bio->media->media_id, lba, bs, block_buffer);
+			if (!EFI_ERROR(ws)) {
+				bio->flush_blocks(bio);
+				if (noverify) {
+					same = 1;
+				} else {
+					rs = bio->read_blocks(bio, bio->media->media_id, lba, bs,
+					    block_buffer + bs);
+					same = !EFI_ERROR(rs) &&
+					    memcmp(block_buffer, block_buffer + bs, (size_t)bs) == 0;
+				}
+			}
+			disarm_guard();
+			print("logtest: write %x read %x same %d (writes this session: %d)\n", ws, rs, same,
+			    write_count);
+			set_result(!EFI_ERROR(ws) && same ? "logtest-ok" : "logtest-fail", ws, rs);
 		} else if (starts_with(cmd, "oem log")) {
 			if (busy) {
 				compose_live_log(running_live, running_slide);
@@ -3762,6 +4039,182 @@ fb_command(char *cmd)
 				compose_logs(NULL, 0);
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem prevlog")) {
+			/*
+			 * Stage the log partition as found: what the previous session wrote there
+			 * before it jumped into the kernel and while the kernel ran on another
+			 * core. A reset does not take it with it, and this loader does not write
+			 * the partition at boot, so a run that died still has its whole story on
+			 * the disk. The host fetches it with get_staged and trims the NUL padding.
+			 */
+			efi_block_io *bio = find_log_partition();
+
+			if (bio == NULL) {
+				fb_reply("FAIL", "no log partition");
+				return;
+			}
+			uint64_t bytes = 256 * 1024;
+			uint64_t part = ((uint64_t)bio->media->last_block + 1) * (uint64_t)bio->media->block_size;
+
+			if (bytes > part) {
+				bytes = part;
+			}
+			if (bytes > sizeof(out_buf)) {
+				bytes = sizeof(out_buf);
+			}
+			memset(out_buf, 0, bytes);
+			if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, bytes, out_buf))) {
+				fb_reply("FAIL", "logdump read failed");
+				return;
+			}
+			staged_data = out_buf;
+			staged_len = bytes;
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem parts")) {
+			/*
+			 * The GPT partitions: name, size, first bytes on the disk. "oem flashpart" needs
+			 * exact names, and the first bytes say what actually is on them (a boot image
+			 * magic, a silicium image, nothing). Fetch the list with "oem log" afterwards.
+			 */
+			static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+			static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+			efi_handle *handles;
+			uint64_t count;
+
+			if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+				fb_reply("FAIL", "no partitions");
+				return;
+			}
+			print("== partitions ==\n");
+			for (uint64_t i = 0; i < count; i++) {
+				efi_partition_info *info;
+				efi_block_io *bio;
+				char nm[37];
+				uint64_t bs;
+
+				if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) ||
+				    info->type != 2) {
+					continue;
+				}
+				for (unsigned k = 0; k < 36; k++) {
+					nm[k] = info->name[k] >= 32 && info->name[k] < 127 ? (char)info->name[k] : '?';
+				}
+				nm[36] = 0;
+				if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
+				    bio->media == NULL) {
+					print("%s: no block I/O\n", nm);
+					continue;
+				}
+				bs = bio->media->block_size;
+				print("%s: %d MB", nm, (((uint64_t)bio->media->last_block + 1) * bs) >> 20);
+				if (bs != 0 && bs <= BLOCK_BUFFER_SIZE &&
+				    !EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, bs, block_buffer))) {
+					print(" head");
+					for (unsigned k = 0; k < 16; k++) {
+						print(" %x", block_buffer[k]);
+					}
+				}
+				print("\n");
+			}
+			print("== end of partitions ==\n");
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem flashpart")) {
+			/*
+			 * Write the last downloaded payload to a named GPT partition and verify it by
+			 * reading it back. This is the only road to a new loader in "boot" while a
+			 * loader is resident (its "reboot" is a cold reset to exactly that partition,
+			 * and nothing here can ask the firmware for the boot menu instead). The write
+			 * goes out in one call: on a device where only the session's first write
+			 * completes, a chunked one would strand the image half-written. The guard is
+			 * armed: a stuck write means a reset, not a zombie.
+			 */
+			const char *name = cmd + 13;
+			efi_block_io *bio;
+			uint64_t bs, part;
+			efi_status ws;
+			int ok;
+
+			while (*name == ' ') {
+				name++;
+			}
+			if (*name == 0) {
+				fb_reply("FAIL", "which partition?");
+				return;
+			}
+			if (download_len == 0) {
+				fb_reply("FAIL", "nothing downloaded");
+				return;
+			}
+			bio = find_named_partition(name);
+			if (bio == NULL) {
+				fb_reply("FAIL", "no such partition");
+				return;
+			}
+			bs = bio->media->block_size;
+			part = ((uint64_t)bio->media->last_block + 1) * bs;
+			if (bs == 0 || download_len > part || download_len % bs != 0) {
+				fb_reply("FAIL", "bad size");
+				return;
+			}
+			fb_reply("OKAY", "");
+			arm_guard(300);
+			print("flashpart: %d bytes to %s\n", download_len, name);
+			if (write_count != 0 && (writefix & 1) && bio->reset != NULL) {
+				((bio_reset_fn)bio->reset)(bio, 0);
+			}
+			write_count++;
+			ws = bio->write_blocks(bio, bio->media->media_id, 0, download_len,
+			    (void *)(uintptr_t)PAYLOAD_BASE);
+			ok = !EFI_ERROR(ws);
+			if (ok) {
+				bio->flush_blocks(bio);
+				for (uint64_t off = 0; ok && off < download_len;) {
+					uint64_t chunk = download_len - off > BLOCK_BUFFER_SIZE ?
+					    BLOCK_BUFFER_SIZE : download_len - off;
+
+					if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, off / bs,
+					    chunk, block_buffer)) ||
+					    memcmp(block_buffer, (const void *)(uintptr_t)(PAYLOAD_BASE + off),
+					    (size_t)chunk) != 0) {
+						ok = 0;
+						break;
+					}
+					off += chunk;
+				}
+			}
+			disarm_guard();
+			print(ok ? "flashpart: verified\n" : "flashpart: FAILED (%x)\n", ok ? 0 : ws);
+			set_result(ok ? "flash-ok" : "flash-fail", download_len, ok ? 0 : ws);
+			/* deliberately no flush_log: under the affliction above it would be the write
+			   after the image's, and the host reads the outcome from getvar result anyway */
+		} else if (starts_with(cmd, "oem writefix")) {
+			/* bit 0: reset the block I/O before write #2 and later; bit 1: no read-back */
+			const char *arg = cmd + 12;
+
+			while (*arg == ' ') {
+				arg++;
+			}
+			writefix = (uint32_t)parse_number(arg, 10);
+			print("writefix: %d\n", writefix);
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem guardoff")) {
+			disarm_guard();
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem guard")) {
+			/* arm the hardware dead man for N seconds: the canary for PSCI CPU_ON itself */
+			const char *arg = cmd + 9;
+			uint64_t secs;
+
+			while (*arg == ' ') {
+				arg++;
+			}
+			secs = parse_number(arg, 10);
+			if (secs == 0 || secs > 3600) {
+				fb_reply("FAIL", "seconds?");
+				return;
+			}
+			arm_guard(secs);
+			fb_reply(guard_on ? "OKAY" : "FAIL", guard_on ? "" : "the guard would not start");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
@@ -3929,6 +4382,7 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
+	print("build: v2 %s %s\n", __DATE__, __TIME__);
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
@@ -3955,7 +4409,14 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
-		flush_log();
+		/*
+		 * Deliberately no flush here: this boot's log would land on LBA 0 of logdump, on top
+		 * of what a session that never came back from the kernel left there. That log is the
+		 * only trace of a run that ended in a reset (it is written before the jump into the
+		 * kernel and, while it runs on another core, every two seconds), and "oem prevlog"
+		 * reads it. This session's own log still reaches the partition exactly when it
+		 * matters: before the jump and during the run.
+		 */
 		usb_command_loop();
 	}
 
