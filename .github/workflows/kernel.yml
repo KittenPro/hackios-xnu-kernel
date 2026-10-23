@@ -46,6 +46,16 @@ jobs:
             fi
           done
           clang --version | head -1
+          # The kernel's final dSYM step (makedefs/MakeInc.kernel) runs $(DSYMUTIL), which no
+          # makedefs file defines: it comes from the environment, and machines with an
+          # unversioned dsymutil in PATH (Arch's llvm package) just work. Provide one from
+          # the same LLVM release; the build step below has a bypass if this comes to nothing.
+          if sudo apt-get install -y --no-install-recommends "llvm-$v" >/dev/null 2>&1 &&
+            [ -x "/usr/bin/dsymutil-$v" ]; then
+            sudo ln -sf "/usr/bin/dsymutil-$v" /usr/bin/dsymutil
+          fi
+          command -v dsymutil >/dev/null && dsymutil --version | head -1 ||
+            echo "no dsymutil: the kernel build will bypass the dSYM (BUILD_DSYM=0)"
           # The cctools binaries may want libtinfo5, which noble no longer ships.
           (curl -sLO http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.1_amd64.deb &&
             sudo dpkg -i libtinfo5_*.deb) ||
@@ -57,6 +67,7 @@ jobs:
         with:
           path: ~/theos
           key: theos-linux-x86_64-v1
+          save-always: true
 
       - name: Install theos toolchain and SDK
         if: steps.theos.outputs.cache-hit != 'true'
@@ -76,11 +87,13 @@ jobs:
       - name: Cache the kernel tree and the dependencies
         uses: actions/cache@v4
         with:
-          # exact keys only: a stale restore would skip apply.sh and build yesterday's patch
+          # exact keys only: a stale restore would skip apply.sh and build yesterday's patch;
+          # save-always: a failed run's compiled objects still make the next one incremental
           path: |
             xnu-src
             xnu-deps
           key: xnu-${{ hashFiles('xnu/**', 'xnu-deps/**', 'xnu-build.sh', 'xnu-env.sh') }}
+          save-always: true
 
       - name: Kernel sources (Apple's release + redwood)
         run: '[ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh'
@@ -92,11 +105,25 @@ jobs:
         run: |
           mkdir -p out
           touch out/.kernel-start
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          build() { ./xnu-build.sh -j"$(nproc)" -k "$@" > kernel-build.log 2>&1 || true; }
+          # The final kernel file depends on the .dSYM step, whose $(DSYMUTIL) is an
+          # environment variable nowhere defined: give it one explicitly, and if the step
+          # still fails, retry with XNU's own BUILD_DSYM=0 bypass (everything else is up to
+          # date by then, so the retry only redoes the dSYM and the strip: minutes).
+          if command -v dsymutil >/dev/null; then
+            build "DSYMUTIL=$(command -v dsymutil)"
+            [ -f "$K" ] || {
+              echo "=== the dSYM path failed; retrying with BUILD_DSYM=0 ==="
+              cp kernel-build.log kernel-build-dsym-attempt.log
+              build BUILD_DSYM=0
+            }
+          else
+            build BUILD_DSYM=0
+          fi
+          tail -40 kernel-build.log
           # the export check fails after the kernel is linked, on purpose (xnu/README.md):
           # judge by the file, the way common/build.sh does
-          ./xnu-build.sh -j"$(nproc)" -k > kernel-build.log 2>&1 || true
-          tail -40 kernel-build.log
-          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
           if ! [ -f "$K" ] || { ! [ "$K" -nt out/.kernel-start ] && grep -q "error:" kernel-build.log; }; then
             echo "=== the kernel did not build: $(grep -c 'error:' kernel-build.log || true) errors ==="
             exit 1
@@ -117,6 +144,7 @@ jobs:
           name: build-logs
           path: |
             kernel-build.log
+            kernel-build-dsym-attempt.log
             xnu-deps/mig-build.log
             xnu-deps/tcsh-build.log
             xnu-deps/exporthdrs.log
